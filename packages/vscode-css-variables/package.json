@@ -115,6 +115,12 @@
 						]
 					}
 				},
+				"cssVariables.ignoreSelectors": {
+					"type": "array",
+					"default": [],
+					"markdownDescription": "Configure selectors to ignore when resolving CSS variables (e.g. '[mode=\"dark\"]')",
+					"scope": 3
+				},
 				"cssVariables.trace.server": {
 					"scope": "window",
 					"type": "string",

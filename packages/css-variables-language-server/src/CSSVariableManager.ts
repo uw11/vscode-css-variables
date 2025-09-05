@@ -9,8 +9,8 @@ import path from 'path';
 import postcssSCSS from 'postcss-scss';
 import postcssLESS from 'postcss-less';
 import CacheManager from './CacheManager';
-import isColor from './utils/isColor';
 import { culoriColorToVscodeColor } from './utils/culoriColorToVscodeColor';
+import { isWithinIgnoredSelector } from './utils/isWithinIgnoredSelector';
 
 export type CSSSymbol = {
   name: string
@@ -26,6 +26,7 @@ export type CSSVariable = {
 export interface CSSVariablesSettings {
   lookupFiles: string[]
   blacklistFolders: string[]
+  ignoreSelectors?: string[]
 }
 
 // The global settings, used when the `workspace/configuration` request is not supported by the client.
@@ -55,7 +56,7 @@ const getAST = (filePath: string, content: string) => {
   if (fileExtension === '.less') {
     return postcssLESS.parse(content);
   }
-  
+
   if (fileExtension === '.scss') {
     return postcssSCSS.parse(content);
   }
@@ -66,12 +67,62 @@ const getAST = (filePath: string, content: string) => {
 export default class CSSVariableManager {
   private cacheManager = new CacheManager<CSSVariable>();
 
+  private resolveCachedVariables = () => {
+    for (const filePath of this.cacheManager.getFiles()) {
+      this.cacheManager.getAll(filePath).forEach((variable, key) => {
+        this.setCssVariable(key, this.resolveRecursiveVariables(variable.symbol.value), filePath, variable.definition.range);
+      });
+    }
+  };
+
+  public resolveRecursiveVariables = (value: string) => {
+    for (let i = 0; i < 20; i++) {
+      const variableReference = value.match(/^var\(\s*([a-zA-Z0-9-]+)\s*\)$/)?.[1];
+      if (variableReference) {
+        const newValue = this.cacheManager.get(variableReference)?.symbol?.value;
+        if (newValue) {
+          value = newValue;
+        } else {
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+
+    return value;
+  };
+
+  public setCssVariable = (prop: string, value: string, filePath: string, range: Range) => {
+    const variable: CSSVariable = {
+      symbol: {
+        name: prop,
+        value: value,
+      },
+      definition: {
+        uri: filePath,
+        range: range,
+      },
+    };
+
+    const culoriColor = culori.parse(value);
+
+    if (culoriColor) {
+      variable.color = culoriColorToVscodeColor(culoriColor);
+    }
+
+    // add to cache
+    this.cacheManager.set(filePath, prop, variable);
+  };
+
   public parseCSSVariablesFromText = async ({
     content,
     filePath,
+    settings,
   }: {
     content: string
     filePath: string
+    settings: CSSVariablesSettings
   }) => {
     try {
       // reset cache for this file
@@ -108,6 +159,7 @@ export default class CSSVariableManager {
             return this.parseCSSVariablesFromText({
               content: cssText,
               filePath: url,
+              settings,
             });
           } catch (err) {
             console.log(err, `cannot fetch data from ${url}`);
@@ -117,36 +169,33 @@ export default class CSSVariableManager {
 
       ast.walkDecls((decl) => {
         if (decl.prop.startsWith('--')) {
-          const variable: CSSVariable = {
-            symbol: {
-              name: decl.prop,
-              value: decl.value,
-            },
-            definition: {
-              uri: fileURI,
-              range: Range.create(
-                Position.create(
-                  decl.source.start.line - 1,
-                  decl.source.start.column - 1
-                ),
-                Position.create(
-                  decl.source.end.line - 1,
-                  decl.source.end.column - 1
-                )
-              ),
-            },
-          };
-
-          const culoriColor = culori.parse(decl.value);
-
-          if (culoriColor) {
-            variable.color = culoriColorToVscodeColor(culoriColor);
+          // Only skip redefinitions within ignored selectors
+          if (isWithinIgnoredSelector(decl, settings.ignoreSelectors)) {
+            // If this variable already exists, skip this redefinition
+            if (this.cacheManager.get(decl.prop)) {
+              return;
+            }
+            // Otherwise, this is the first declaration, so we should keep it
           }
-
-          // add to cache
-          this.cacheManager.set(filePath, decl.prop, variable);
+          this.setCssVariable(
+            decl.prop,
+            decl.value,
+            fileURI,
+            Range.create(
+              Position.create(
+                decl.source.start.line - 1,
+                decl.source.start.column - 1
+              ),
+              Position.create(
+                decl.source.end.line - 1,
+                decl.source.end.column - 1
+              )
+            )
+          );
         }
       });
+
+      this.resolveCachedVariables();
     } catch (error) {
       console.error(filePath);
     }
@@ -169,6 +218,7 @@ export default class CSSVariableManager {
             return this.parseCSSVariablesFromText({
               content,
               filePath,
+              settings,
             });
           })
         );
